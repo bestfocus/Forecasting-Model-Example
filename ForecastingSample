@@ -1,0 +1,154 @@
+# Forecasting Model Example
+
+import numpy as np
+import pandas as pd
+from lightgbm import LGBMRegressor
+
+a = pd.read_csv("/kaggle/input/m5-forecasting-accuracy/sales_train_evaluation.csv")
+b = pd.read_csv("/kaggle/input/m5-forecasting-accuracy/sample_submission.csv")
+c = pd.read_csv("/kaggle/input/m5-forecasting-accuracy/calendar.csv",skiprows=0)
+d = pd.read_csv("/kaggle/input/m5-forecasting-accuracy/sell_prices.csv",skiprows=0)
+
+for i in range(1942, 1970):
+    col = 'd_' + str(i)
+    a[col] = 0
+    a[col] = a[col].astype(np.int16)
+
+for col in ['item_id','dept_id','cat_id','store_id','state_id']:
+    a[col] = a[col].astype('category')
+
+for col in ['item_id','store_id']:
+    d[col] = d[col].astype('category')
+
+df = a.melt(id_vars=['id','item_id', 'dept_id', 'cat_id', 'store_id', 'state_id'], var_name='d', value_name='sold').dropna()
+lags = [1,2,7,14,21,28]
+for lag in lags:
+    df['soldlag'+str(lag)] = df.groupby(['store_id','item_id'])['sold'].shift(lag).astype(np.float16)
+
+eventoh1 = pd.get_dummies(c['event_name_1'])
+eventoh2 = pd.get_dummies(c['event_name_2'])
+for col in set(eventoh1.columns).intersection(eventoh2):
+    eventoh1[col] = eventoh1[col] + eventoh2[col]
+c = c.join(eventoh1)
+lags = [1,2,3]
+for lag in lags:
+    c['Thanksgivinglag'+str(lag)] = c['Thanksgiving'].shift(lag).astype(np.float16)
+
+d['pricewkchg'] = d.groupby(['store_id','item_id'])['sell_price'].diff().fillna(0)
+d['pricewkpctchg'] = d.groupby(['store_id','item_id'])['sell_price'].pct_change().fillna(0)
+
+df = df.merge(c, left_on=['d'], right_on=['d'])
+df['d'] = df['d'].transform(lambda x: int(x[2:])).astype(np.int16)
+df.drop(columns=['id','date','weekday','event_name_1','event_name_2','event_type_1','event_type_2'], inplace=True)
+
+df = df.merge(d, on=['store_id', 'item_id', 'wm_yr_wk'], how='left')
+df = df[~df['sell_price'].isna()]
+
+code2id = dict(zip(df['item_id'].cat.codes, df['item_id']))
+code2store = dict(zip(df['store_id'].cat.codes, df['store_id']))
+for col in ['item_id','dept_id','cat_id','store_id','state_id']:
+    df[col] = df[col].cat.codes
+df = df[df['d']>=28]
+
+# effects of holidays
+df[['Thanksgivinglag1','sold','soldlag1', 'soldlag2', 'soldlag7','soldlag14', 'soldlag28']].groupby(['Thanksgivinglag1']).mean()
+
+model1 = LGBMRegressor(n_estimators=20, max_depth=3)
+training = df[df['d']<1914]
+X_train = training.drop(columns=['sold'])
+y_train = training['sold']
+validate = df[(df['d']>=1914) & (df['d']<1942)]
+X_valid = validate.drop(columns=['sold'])
+y_valid = validate['sold']
+model1.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_valid, y_valid)], eval_metric='rmse', verbose=20, early_stopping_rounds=20)
+
+test = df[df['d']>=1942]
+pred = model1.predict(test.drop(columns=['sold']))
+test.reset_index().loc[:,['item_id','d']].join(pd.DataFrame(pred)).groupby(['item_id']).mean().iloc[:,-1]
+
+# feature importance
+features = [f for f in test.columns if f != 'sold']
+pd.DataFrame(model1.feature_importances_, index=features)
+
+# group by each store
+storedaily = df.groupby(['store_id','d']).mean()
+store0 = storedaily.loc[(0)] # first index: store = 0
+amt = storedaily.loc[(0)]['sold']
+
+def split_into_train_test(data, in_size, fh):
+    train, test = data[:-fh], data[-(fh+in_size):]
+    x_train, y_train = train[:-1], np.roll(train, -in_size)[:-in_size] # np.roll rotates data in an array
+    x_test, y_test = test[:-1], np.roll(test, -in_size)[:-in_size]
+    x_train = np.reshape(x_train, (-1, 1))
+    x_test = np.reshape(x_test, (-1, 1))
+    tmp_test = np.roll(x_test, -1)
+    tmp_train = np.roll(x_train, -1)
+    for x in range(1, in_size): # add data of one day in the observation window each time
+        x_train = np.concatenate((x_train[:-1], tmp_train[:-1]), -1)
+        x_test = np.concatenate((x_test[:-1], tmp_test[:-1]), -1)
+        tmp_test = np.roll(tmp_test, -1)[:-1]
+        tmp_train = np.roll(tmp_train, -1)[:-1]
+    return x_train, y_train, x_test, y_test
+
+Xtrain0, ytrain0, Xtest, ytest = split_into_train_test(np.array(amt), 366, 28)
+Xtrain0 = pd.DataFrame(Xtrain0).join(store0.drop(columns = ['sold','wm_yr_wk','item_id']).iloc[366:].reset_index(drop=True))
+Xtest = pd.DataFrame(Xtest).join(store0.drop(columns = ['sold','wm_yr_wk','item_id']).iloc[-28:].reset_index(drop=True))
+Xtrain = Xtrain0[:-28]
+ytrain = ytrain0[:-28]
+Xvalid = Xtrain0[-28:]
+yvalid = ytrain0[-28:]
+
+#min_child_weight if too large like 300, the model will use fewer features
+model1 = LGBMRegressor(n_estimators=1000,learning_rate=0.3,subsample=0.8,colsample_bytree=0.8,max_depth=8,num_leaves=50,min_child_weight=3)
+model1.fit(Xtrain, ytrain, eval_set=[(Xtrain, ytrain), (Xvalid, yvalid)], eval_metric='rmse', verbose=20, early_stopping_rounds=20)
+pred = model1.predict(Xtest)
+# feature importance
+features = [f for f in Xtest.columns]
+importance = pd.DataFrame(model1.feature_importances_, index=features, columns=['importance'])
+importance.sort_values('importance', ascending=False)[:30]
+
+output = pd.DataFrame()
+for item in sorted(code2id.keys()[:1]):
+    for store in sorted(code2store.keys()):
+        print(str(item) + ' ' + str(store))
+        window = 366
+        lackData = False
+        itemstore = df[(df['item_id']==item) & (df['store_id']==store)]['sold']
+        # if the data is less than a year
+        if len(itemstore) <= window + 28 * 3:
+            lackData = True
+            window = len(itemstore) - 28 * 3 # have at least validation, test and another 28 dates for training
+            Xtrain00, ytrain0, Xtest0, ytest0=split_into_train_test(np.array(itemstore), window, 28)
+            state = df[(df['item_id']==item) & (df['store_id']==store)]['state_id'].unique()[0]
+            itemstoreavg = df[(df['item_id']==item) & (df['state_id']==state)].groupby(['item_id','d']).mean()['sold'] # for some store that doesn't have enough historic data
+            itemstore = itemstoreavg
+        Xtrain0, ytrain0, Xtest, ytest = split_into_train_test(np.array(itemstore), window, 28)
+
+        Xtrain0 = pd.DataFrame(Xtrain0).join(store0.drop(columns=['sold','wm_yr_wk','item_id']).iloc[window:].reset_index(drop=True))
+        Xtest = pd.DataFrame(Xtest).join(store0.drop(columns=['sold','wm_yr_wk','item_id']).iloc[-28:].reset_index(drop=True))
+        Xtrain = Xtrain0[:-28]
+        ytrain = ytrain0[:-28]
+        Xvalid = Xtrain0[-28:]
+        yvalid = ytrain0[-28:]
+
+        model1.fit(Xtrain, ytrain, eval_set = [(Xtrain, ytrain), (Xvalid, yvalid)], eval_metric='rmse', verbose=False, early_stopping_rounds=20)
+        if lackData:
+            Xtest = Xtest0
+            Xtest = pd.DataFrame(Xtest).join(store0.drop(columns=['sold','wm_yr_wk','item_id']).iloc[-28:].reset_index(drop=True))
+            Xvalid = Xtrain00[-28:]
+            Xvalid = pd.DataFrame(Xvalid).join(store0.drop(columns=['sold','wm_yr_wk','item_id']).iloc[-28:].reset_index(drop=True))
+           
+        pred = model1.predict(Xtest)
+        fcolumns = ['F'+str(i) for i in range(1, 29)]
+        new = pd.DataFrame(np.array(pred).reshape(1,-1), columns=fcolumns, dtype=float).round(2)
+        new.insert(0, 'id', code2id[item]+'_'+code2store[store]+'_evaluation')
+        validation = pd.DataFrame(np.array(model1.predict(Xvalid)).reshape(1,-1), columns=fcolumns, dtype=float).round(2)
+        validation.insert(0, 'id', code2id[item]+'_'+code2store[store]+'_validation')
+        if output.empty:
+            output = new
+            output = output.append(validation)
+        else:
+            output = output.append(new)
+            output = output.append(validation)
+    if item > 0 and item % 500 == 0:
+        output.to_csv('/kaggle/working/output15_'+str(item)+'.csv', index=False)
